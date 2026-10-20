@@ -25,6 +25,7 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s",
 )
 log = logging.getLogger("o2_invoice_mailer")
+STATE_FILE = Path(__file__).with_name(".o2_state.json")  # gespeicherte Browser-Sitzung (enthaelt Cookies!)
 
 # Common OneTrust-style cookie banner selectors used on many German sites,
 # including o2online.de at the time of writing. Adjust if the banner changes.
@@ -46,24 +47,41 @@ def dismiss_cookie_banner(page):
     log.info("Kein Cookie-Banner gefunden oder bereits akzeptiert")
 
 
-def login(page, username: str, password: str, login_url: str):
+def login(page, username: str, password: str, login_url: str, interactive: bool = False):
     log.info("Oeffne Login-Seite: %s", login_url)
     page.goto(login_url)
+    page.wait_for_load_state("networkidle")
+    if "login.o2online.de" not in page.url:
+        log.info("Bereits eingeloggt (gespeicherte Sitzung)")
+        return
     dismiss_cookie_banner(page)
 
-    # NOTE: These selectors are best-effort placeholders. This script was
-    # written without live access to o2online.de (network egress to the
-    # site was blocked in the environment it was authored in), so verify
-    # and adjust them against the real page before relying on this script.
-    # Run with --debug to open a headed browser and inspect the DOM
-    # (right-click a field -> Untersuchen) to find the correct selectors.
-    page.fill("#username", username)  # TODO: verify field selector
-    page.fill("#password", password)  # TODO: verify field selector
-    page.click("button[type='submit']")  # TODO: verify submit button selector
+    # Der Login (login.o2online.de) laeuft zweistufig: erst Benutzername,
+    # dann Passwort (callback_3_od = Benutzername, callback_4_od = Passwort).
+    page.wait_for_selector("input[name='callback_3_od']", timeout=20000)
+    page.fill("input[name='callback_3_od']", username)
+    page.keyboard.press("Enter")
 
-    page.wait_for_load_state("networkidle")
+    page.wait_for_selector("input[name='callback_4_od']", timeout=20000)
+    page.fill("input[name='callback_4_od']", password)
+    page.keyboard.press("Enter")
 
-    if page.locator("text=Zwei-Faktor").count() or page.locator("text=SMS-Code").count():
+    # Warten, bis entweder das Portal geladen ist oder die Sicherheitsabfrage erscheint
+    page.wait_for_function(
+        "() => !location.host.includes('login.o2online.de') "
+        "|| document.body.innerText.includes('Sicherheitsabfrage')",
+        timeout=30000,
+    )
+
+    if interactive and page.locator("text=Sicherheitsabfrage").count():
+        log.info(
+            "O2 verlangt einen Sicherheitscode per E-Mail. Bitte im Browser "
+            "'Jetzt E-Mail senden' klicken und den Code eingeben (max. 5 Min.)"
+        )
+        page.wait_for_url(lambda url: "login.o2online.de" not in url, timeout=300000)
+        page.wait_for_load_state("networkidle")
+
+    if page.locator("text=Zwei-Faktor").count() or page.locator("text=SMS-Code").count() or page.locator("text=Sicherheitsabfrage").count():
         raise RuntimeError(
             "O2 verlangt eine Zwei-Faktor-Bestaetigung (SMS/App-Code). "
             "Dieses Script kann interaktive 2FA nicht automatisch loesen."
@@ -78,12 +96,9 @@ def download_latest_invoice(page, invoice_url: str, download_dir: Path) -> Path:
     dismiss_cookie_banner(page)
     page.wait_for_load_state("networkidle")
 
-    # TODO: verify the selector for the "download latest invoice" control.
-    # A common pattern is a link/button labelled "PDF" or "Rechnung
-    # herunterladen" next to the most recent billing period entry.
-    download_trigger = page.locator(
-        "a:has-text('PDF'), button:has-text('Rechnung herunterladen')"
-    ).first
+    # Die Uebersicht listet mehrere Rechnungen; die erste ist die aktuellste.
+    download_trigger = page.locator("a[data-testid='vt-billing.invoice-download']").first
+    download_trigger.wait_for(timeout=30000)
 
     with page.expect_download() as download_info:
         download_trigger.click()
@@ -126,15 +141,11 @@ def send_invoice_mail(
     log.info("Mail gesendet")
 
 
-def load_config() -> dict:
+def load_config(need_mail: bool = True) -> dict:
     load_dotenv()
-    required = [
-        "O2_USERNAME",
-        "O2_PASSWORD",
-        "GMAIL_ADDRESS",
-        "GMAIL_APP_PASSWORD",
-        "MAIL_TO",
-    ]
+    required = ["O2_USERNAME", "O2_PASSWORD"]
+    if need_mail:
+        required += ["GMAIL_ADDRESS", "GMAIL_APP_PASSWORD", "MAIL_TO"]
     missing = [key for key in required if not os.getenv(key)]
     if missing:
         log.error(
@@ -147,15 +158,15 @@ def load_config() -> dict:
         "username": os.environ["O2_USERNAME"],
         "password": os.environ["O2_PASSWORD"],
         "login_url": os.getenv(
-            "O2_LOGIN_URL", "https://www.o2online.de/mein-o2/login/"
+            "O2_LOGIN_URL", "https://login.o2online.de/signin/?goto=https%3A%2F%2Fwww.o2online.de%2Fmein-o2%2F"
         ),
         "invoice_url": os.getenv(
             "O2_INVOICE_URL", "https://www.o2online.de/mein-o2/rechnung/"
         ),
         "download_dir": Path(os.getenv("DOWNLOAD_DIR", "./downloads")),
-        "gmail_address": os.environ["GMAIL_ADDRESS"],
-        "gmail_app_password": os.environ["GMAIL_APP_PASSWORD"],
-        "mail_to": [addr.strip() for addr in os.environ["MAIL_TO"].split(",")],
+        "gmail_address": os.getenv("GMAIL_ADDRESS", ""),
+        "gmail_app_password": os.getenv("GMAIL_APP_PASSWORD", ""),
+        "mail_to": [a.strip() for a in os.getenv("MAIL_TO", "").split(",") if a.strip()],
     }
 
 
@@ -171,19 +182,36 @@ def main():
         action="store_true",
         help="Rechnung herunterladen, aber keine Mail versenden",
     )
+    parser.add_argument(
+        "--setup",
+        action="store_true",
+        help="Einmalig: sichtbarer Login inkl. E-Mail-Sicherheitscode, speichert die Sitzung in "
+        + STATE_FILE.name,
+    )
     args = parser.parse_args()
 
-    config = load_config()
+    config = load_config(need_mail=not (args.dry_run or args.setup))
 
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(
-            headless=not args.debug,
+            headless=not (args.debug or args.setup),
             slow_mo=250 if args.debug else 0,
         )
-        context = browser.new_context(accept_downloads=True)
+        context = browser.new_context(
+            accept_downloads=True,
+            storage_state=str(STATE_FILE) if STATE_FILE.exists() and not args.setup else None,
+        )
         page = context.new_page()
         try:
-            login(page, config["username"], config["password"], config["login_url"])
+            login(
+                page, config["username"], config["password"], config["login_url"],
+                interactive=args.setup,
+            )
+            if args.setup:
+                context.storage_state(path=str(STATE_FILE))
+                STATE_FILE.chmod(0o600)
+                log.info("Sitzung gespeichert: %s", STATE_FILE)
+                return
             invoice_path = download_latest_invoice(
                 page, config["invoice_url"], config["download_dir"]
             )

@@ -3,3 +3,4 @@ downloads/
 __pycache__/
 *.pyc
 .venv/
+.o2_state.json
